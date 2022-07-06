@@ -1,0 +1,1562 @@
+---
+title: 'Part 5: Spatial Pipeline'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(tidyverse)
+library(pscl)
+library(MASS)
+library(numform)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## White Ibis
+
+### Load the data
+
+```{r}
+# Load training data
+ibis <- read_csv("data/ebd_white_ibis_train.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_white_ibis_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+ibis <- ibis %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.ibis <- do.call(rbind, by(ibis, ibis$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.ibis) == nrow(unique(data.frame(ibis$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.ibis$latitude, unique.ibis$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.ibis$latitude, unique.ibis$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.ibis$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the white ibis
+
+```{r}
+load("white_ibis_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = ibis)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = ibis$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "white_ibis_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.white.ibis.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.white.ibis.tos, method = "holm"))
+
+# Duration in minutes
+p.white.ibis.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.white.ibis.durmin, method = "holm"))
+
+# Distance traveled
+p.white.ibis.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.white.ibis.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.white.ibis.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.white.ibis.pland02, method = "holm"))
+
+# Woody savanna
+p.white.ibis.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.white.ibis.pland08, method = "holm"))
+
+# Grassland
+p.white.ibis.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.white.ibis.pland10, method = "holm"))
+
+# Wetland
+p.white.ibis.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.white.ibis.pland11, method = "holm"))
+
+# Urban
+p.white.ibis.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.white.ibis.pland13, method = "holm"))
+
+# Mean elevation
+p.white.ibis.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.white.ibis.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.white.ibis.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.white.ibis.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+white.ibis.hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(white.ibis.hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+white.ibis.hgam.pvals <- data.frame(white.ibis.hgam.pvals)
+
+colnames(white.ibis.hgam.pvals) <- c("White Ibis")
+
+white.ibis.hgam.pvals
+```
+
+### Calculate MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = ibis.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Glossy Ibis
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+ibis <- read_csv("data/ebd_glossy_ibis_train.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_glossy_ibis_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+ibis <- ibis %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.ibis <- do.call(rbind, by(ibis, ibis$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.ibis) == nrow(unique(data.frame(ibis$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.ibis$latitude, unique.ibis$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.ibis$latitude, unique.ibis$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.ibis$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the glossy ibis
+
+```{r}
+load("glossy_ibis_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = ibis)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = ibis$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "glossy_ibis_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Glossy Ibis")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = ibis.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Great Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_great_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_great_egret_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+egret <- egret %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.egret <- do.call(rbind, by(egret, egret$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.egret) == nrow(unique(data.frame(egret$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.egret$latitude, unique.egret$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.egret$latitude, unique.egret$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.egret$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the great egret
+
+```{r}
+load("great_egret_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = egret)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = egret$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "great_egret_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Great Egret")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Cattle Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_cattle_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_cattle_egret_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+egret <- egret %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.egret <- do.call(rbind, by(egret, egret$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.egret) == nrow(unique(data.frame(egret$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.egret$latitude, unique.egret$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.egret$latitude, unique.egret$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.egret$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the cattle egret
+
+```{r}
+load("cattle_egret_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = egret)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = egret$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "cattle_egret_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Cattle Egret")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Snowy Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_snowy_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_snowy_egret_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+egret <- egret %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.egret <- do.call(rbind, by(egret, egret$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.egret) == nrow(unique(data.frame(egret$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.egret$latitude, unique.egret$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.egret$latitude, unique.egret$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.egret$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the snowy egret
+
+```{r}
+load("snowy_egret_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = egret)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = egret$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "snowy_egret_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Snowy Egret")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Great Blue Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_gbh_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_gbh_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+heron <- heron %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.heron <- do.call(rbind, by(heron, heron$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.heron) == nrow(unique(data.frame(heron$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.heron$latitude, unique.heron$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.heron$latitude, unique.heron$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.heron$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the great blue heron
+
+```{r}
+load("gbh_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = heron)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = heron$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "gbh_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Great Blue Heron")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Little Blue Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_lbh_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_lbh_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+heron <- heron %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.heron <- do.call(rbind, by(heron, heron$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.heron) == nrow(unique(data.frame(heron$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.heron$latitude, unique.heron$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.heron$latitude, unique.heron$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.heron$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the little blue heron
+
+```{r}
+load("lbh_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = heron)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = heron$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "lbh_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Little Blue Heron")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
+## Green Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_green_heron_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_green_heron_2017.csv", show_col_types = FALSE)
+```
+
+### Generate a subset of the data that has one observation per location
+
+```{r}
+heron <- heron %>%
+  mutate(point.ID = group_indices(., longitude, latitude))
+
+unique.heron <- do.call(rbind, by(heron, heron$point.ID,
+                  FUN = function(x) head(x, 1)))
+
+# If we have no observations with the same coordinate point, the following should produce TRUE
+nrow(unique.heron) == nrow(unique(data.frame(heron$point.ID)))
+```
+
+### Create a neighbor object
+
+```{r}
+# Create a data frame of the unique coordinates
+coords.df <- data.frame(unique.heron$latitude, unique.heron$longitude)
+
+# Create a matrix of the unique coordinates
+coords.m <- as.matrix(cbind(unique.heron$latitude, unique.heron$longitude))
+
+# Create a list of checklist IDs for each of these unique coordinates
+IDs <- unique.heron$checklist_id
+
+# Create a Delaunay neighbor object for the unique coordinate matrix
+del.nb <- tri2nb(coords.df, row.names = IDs)
+
+# Generate Sphere of Influence neighbors
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+### Load the quasi-Poisson GAM for the green heron
+
+```{r}
+load("green_heron_gam.model")
+```
+
+### Use that pre-fit model to extract a GAM model matrix
+
+```{r}
+# Use the pre-fit model to extract our GAM model matrix
+X2 <- model.matrix(qpois.gam)
+
+# Note: I am subtracting 1 to remove the intercept
+Zsp <- model.matrix(~ factor(point.ID) -1, data = heron)
+```
+
+### Create a binary weight object from our Sphere of Influence neighbor object
+
+```{r}
+soi.matrix <- nb2mat(soi.nb, style = "B")
+```
+
+### Fit the HGAM using hglm() function as specified
+
+```{r}
+hgam.soi <- hglm(X = X2, y = heron$bird_count, Z = Zsp,
+             family = quasipoisson(),
+             rand.family = CAR(D = soi.matrix),
+             RandC = ncol(Zsp), maxit = 200, conv = 1e-6)
+
+```
+
+### Observe the CAR rho-hat value
+
+```{r}
+summary(hgam.soi)
+```
+
+### Save the HGAM object
+
+```{r}
+save(hgam.soi, file = "green_heron_hgam.model")
+```
+
+### Calculate Holm-adjusted p-values
+
+```{r}
+# Time observations started / hours since midnight
+p.tos <- summary(hgam.soi)$FixCoefMat[(6:10),4]
+tos.pval <- min(p.adjust(p.tos, method = "holm"))
+
+# Duration in minutes
+p.durmin <- summary(hgam.soi)$FixCoefMat[(11:14),4]
+durmin.pval <- min(p.adjust(p.durmin, method = "holm"))
+
+# Distance traveled
+p.dist <- summary(hgam.soi)$FixCoefMat[(15:18),4]
+dist.pval <- min(p.adjust(p.dist, method = "holm"))
+
+# Evergreen broadleaf
+p.pland02 <- summary(hgam.soi)$FixCoefMat[(19:22),4]
+pland02.pval <- min(p.adjust(p.pland02, method = "holm"))
+
+# Woody savanna
+p.pland08 <- summary(hgam.soi)$FixCoefMat[(23:26),4]
+pland08.pval <- min(p.adjust(p.pland08, method = "holm"))
+
+# Grassland
+p.pland10 <- summary(hgam.soi)$FixCoefMat[(27:30),4]
+pland10.pval <- min(p.adjust(p.pland10, method = "holm"))
+
+# Wetland
+p.pland11 <- summary(hgam.soi)$FixCoefMat[(31:34),4]
+pland11.pval <- min(p.adjust(p.pland11, method = "holm"))
+
+# Urban
+p.pland13 <- summary(hgam.soi)$FixCoefMat[(35:38),4]
+pland13.pval <- min(p.adjust(p.pland13, method = "holm"))
+
+# Mean elevation
+p.elevmean <- summary(hgam.soi)$FixCoefMat[(39:42),4]
+elevmean.pval <- min(p.adjust(p.elevmean, method = "holm"))
+
+# Standard deviation of elevation
+p.elevsd <- summary(hgam.soi)$FixCoefMat[(43:46),4]
+elevsd.pval <- min(p.adjust(p.elevsd, method = "holm"))
+```
+
+### Create a vector of all p-values
+
+```{r}
+linear.pvals <- summary(hgam.soi)$FixCoefMat[(2:5), 4]
+
+# Create a vector of all p-values
+hgam.pvals <- round2(c(as.numeric(linear.pvals), tos.pval, durmin.pval, dist.pval, pland02.pval, pland08.pval, pland10.pval, pland11.pval, pland13.pval, elevmean.pval, elevsd.pval), 4)
+
+# Add row names that match the fixed and random effects
+names(hgam.pvals) <- c("Num. observers", "Pland 04", "Pland 12", "Pland 14", "Time started", "Duration minutes", "Distance (km)", "Pland 02", "Pland 08", "Pland 10", "Pland 11", "Pland 13", "Elevation mean", "Elevation SD")
+
+hgam.pvals <- data.frame(hgam.pvals)
+
+colnames(hgam.pvals) <- c("Green Heron")
+
+hgam.pvals
+```
+
+### MAD
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Make predictions using the HGAM fit
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Prepare the tibble
+predictions <- tibble(obs.count, pred.17)
+```
+
+```{r}
+predictions %>% 
+  summarise(mad = mean(abs(obs - pred.17), na.rm = TRUE)) %>% 
+  ungroup()
+```
+
