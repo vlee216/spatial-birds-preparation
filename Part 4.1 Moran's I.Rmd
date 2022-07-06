@@ -1,0 +1,783 @@
+---
+title: "Part 4.1: Moran's I Test for Spatial Autocorrelation"
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(tidyverse)
+library(pscl)
+library(MASS)
+library(numform)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## White Ibis
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_white_ibis_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the white ibis
+load("white_ibis_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+nrow(bird)
+
+nrow(unique(data.frame(bird$latitude, bird$longitude)))
+```
+
+In our white ibis dataset, there are 3787 observations, but only 1860 unique coordinate points. 
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+This p-value is extremely small, close to zero. We do have spatial autocorrelation in the case of the white ibis.
+
+## Glossy Ibis
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_glossy_ibis_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the glossy ibis
+load("glossy_ibis_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Great Egret
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_great_egret_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the great egret
+load("great_egret_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Cattle Egret
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_cattle_egret_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the cattle egret
+load("cattle_egret_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Snowy Egret
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_snowy_egret_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the snowy egret
+load("snowy_egret_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Great Blue Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_gbh_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the great blue heron
+load("gbh_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Little Blue Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_lbh_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the little blue heron
+load("lbh_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+## Green Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+Prepare the data
+
+```{r}
+# Load the training data
+bird <- read_csv("data/ebd_green_heron_train.csv", show_col_types = FALSE)
+```
+
+```{r}
+# Load the quasi-Poisson GAM for the green heron
+load("green_heron_gam.model")
+
+# Extract the residuals (in units of the response)
+resid <- residuals(qpois.gam, type = "response")
+
+# Check that the length of our residual vector matches with the row dimension of the bird dataset
+length(resid) == nrow(bird)
+
+# Attach the residuals to the data
+bird <- bird %>% mutate(resid = resid)
+```
+
+```{r}
+# Create a "lat-long" ID code
+bird <- bird %>% mutate(paste(bird$latitude, bird$longitude, sep = "_"))
+
+# Rename the new variable
+bird <- rename(bird, latlong_id = `paste(bird$latitude, bird$longitude, sep = "_")`)
+
+# If it's worked correctly, this will output TRUE
+length(unique(bird$latlong_id)) == 1860
+```
+
+Now what we want to do is find the average (median) residual value for each latlong ID. (This is because Moran's I won't run for datasets with multiple observations in the same coordinate location.)
+
+```{r}
+avg_resid_df <- bird %>%
+  group_by(latlong_id) %>%
+  summarize(avg_resid = median(resid),
+            latitude = latitude,
+            longitude = longitude)
+
+# Generate a subset of the above dataset that has one observation per location
+unique.latlong <- do.call(rbind, by(avg_resid_df, avg_resid_df$latlong_id,
+                  FUN = function(x) head(x, 1)))
+
+nrow(unique.latlong)
+
+head(unique.latlong)
+```
+
+Now our goal is to run Moran's I test on the residuals from the first subsample.
+
+```{r}
+coords.m <- as.matrix(cbind(unique.latlong$latitude, unique.latlong$longitude))
+IDs <- unique.latlong$latlong_id
+
+# First, create a Delaunay neighbor object
+del.nb <- tri2nb(coords.m, row.names = IDs)
+
+# Then, from that, a Sphere of Influence neighbor object
+soi.nb <- graph2nb(soi.graph(del.nb, coords.m), row.names = IDs)
+```
+
+```{r}
+# Check the assumption of continuity for our residuals
+ggplot(data = unique.latlong, mapping = aes(x = avg_resid)) +
+  geom_histogram(bins = 100)
+```
+
+Good enough!
+
+Now we will run our Moran's I test
+
+```{r}
+moran <- moran.test(unique.latlong$avg_resid, listw = nb2listw(soi.nb, style = "B"))
+
+moran$p.value
+
+round2(moran$p.value, 3)
+```
+
+-End
