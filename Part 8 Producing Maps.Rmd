@@ -1,0 +1,700 @@
+---
+title: 'Part 8: Producing Maps'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(auk)
+library(lubridate)
+library(sf)
+library(gridExtra)
+library(tidyverse)
+library(rnaturalearth)
+library(dplyr)
+
+library(raster)
+library(MODIS)
+library(exactextractr)
+library(viridis)
+library(dggridR)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(pscl)
+library(MASS)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+
+# Load in the white ibis data from Part 1
+ibis <- read_csv("data/ebd_white_ibis.csv", show_col_types = FALSE)
+```
+
+## From Part 2.B: Preparing Environmental Covariates
+
+Establish the spatial boundary for BCR 31
+
+```{r}
+# BCR 31 boundary
+bcr <- read_sf("data/gis-data.gpkg", "bcr") %>% 
+  filter(bcr_code == 31) %>% 
+  # project to the native modis projection
+  st_transform(crs = paste("+proj=sinu +lon_0=0 +x_0=0 +y_0=0",
+                           "+a=6371007.181 +b=6371007.181 +units=m +no_defs"))
+```
+
+Get data for the MODIS tiles that cover BCR 31
+
+```{r}
+# Switch off spherical geometry
+sf_use_s2(FALSE)
+
+# Get tiles for BCR 31, the Floridian peninsula
+tiles <- MODIS::getTile(bcr)
+tiles@tile
+```
+
+Load this MODIS land cover data into R
+
+```{r, warning = FALSE}
+# Earliest year of ibis dataset
+begin_year <- format(min(ibis$observation_date), "%Y.01.01")
+
+# Last year of ibis dataset
+end_year <- format(max(ibis$observation_date), "%Y.12.31")
+
+# Download tiles and combine into a single raster for each year
+tifs <- runGdal(product = "MCD12Q1", collection = "006", SDSstring = "01", 
+                extent = bcr %>% st_buffer(dist = 10000), 
+                begin = begin_year, end = end_year, 
+                outDirPath = "data", job = "modis",
+                MODISserverOrder = "LPDAAC") %>% 
+  pluck("MCD12Q1.006") %>% 
+  unlist()
+
+# Rename the tifs to have better names
+new_names <- format(as.Date(names(tifs)), "%Y") %>%
+  sprintf("modis_mcd12q1_umd_%s.tif", .) %>%
+  file.path(dirname(tifs), .)
+
+file.rename(tifs, new_names)
+```
+
+```{r}
+# Loading in the landcover data
+landcover <- list.files("data/modis", "^modis_mcd12q1_umd",
+                        full.names = TRUE) %>%
+  stack()
+
+# Label the layers with year
+landcover <- names(landcover) %>%
+  str_extract("(?<=modis_mcd12q1_umd_)[0-9]{4}") %>%
+  paste0("y", .) %>%
+  setNames(landcover, .)
+
+# Extract the last year in the land cover data
+max_lc_year <- names(landcover) %>%
+  str_extract("[0-9]{4}") %>%
+  as.integer() %>%
+  max()
+```
+
+Establish neighborhood radius of 2.5 kilometers
+
+```{r}
+neighborhood_radius <- 5 * ceiling(max(res(landcover))) /2
+```
+
+Obtain the full set of distinct checklist locations by year, then create a neighborhood around each location by year
+
+```{r}
+bird_buff <- ibis %>%
+  distinct(year = format(observation_date, "%Y"),
+           locality_id, latitude, longitude) %>%
+# In case the maximum ibis year is after the maximum land cover year available
+# Extend the maximum land cover year data to all future years
+  mutate(year_lc = if_else(as.integer(year) > max_lc_year,
+                           as.character(max_lc_year), year),
+         year_lc = paste0("y", year_lc)) %>%
+# Convert to sf with crs = 4326
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+# Transform to the MODIS projection
+  st_transform(crs = projection(landcover)) %>%
+# Create an area around each point
+  st_buffer(dist = neighborhood_radius) %>%
+# Nest by year
+  nest(data = c(year, locality_id, geometry))
+```
+
+Calculate the number of cells belonging to each land cover class for each checklist location, by year
+
+```{r}
+# Establish a function to summarize landcover data for all locations in a given year
+calculate_pland <- function(yr, regions, lc) {
+  locs <- st_set_geometry(regions, NULL)
+  exact_extract(lc[[yr]], regions, progress = FALSE) %>%
+    map(~ count(., landcover = value)) %>%
+    tibble(locs, data = .) %>%
+    unnest(data)
+}
+
+# Iterate over all years, extracting the land cover values for all locations in each year
+lc_extract <- bird_buff %>%
+  mutate(pland = map2(year_lc, data, calculate_pland, lc = landcover)) %>%
+  select(pland) %>%
+  unnest(cols = pland)
+```
+
+Calculate the proportion of land cover for each location and land cover class, by year
+
+```{r}
+pland <- lc_extract %>%
+# Calculate proportions
+  group_by(locality_id, year) %>%
+  mutate(pland = n / sum(n)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  filter(!is.na(landcover))
+```
+
+Change covariate names and turn the data into a wide format
+
+```{r}
+lc_names <- tibble(landcover = 0:15,
+                   lc_name = c("pland_00_water", 
+                               "pland_01_evergreen_needleleaf", 
+                               "pland_02_evergreen_broadleaf", 
+                               "pland_03_deciduous_needleleaf", 
+                               "pland_04_deciduous_broadleaf", 
+                               "pland_05_mixed_forest",
+                               "pland_06_closed_shrubland", 
+                               "pland_07_open_shrubland", 
+                               "pland_08_woody_savanna", 
+                               "pland_09_savanna", 
+                               "pland_10_grassland", 
+                               "pland_11_wetland", 
+                               "pland_12_cropland", 
+                               "pland_13_urban", 
+                               "pland_14_mosaic", 
+                               "pland_15_barren"))
+
+pland <- pland %>%
+  inner_join(lc_names, by = "landcover") %>%
+  arrange(landcover) %>%
+  select(-landcover)
+
+# As I transform to the wide format, I'll fill in any implicit missing values with 0. 
+pland <- pland %>%
+  pivot_wider(names_from = lc_name,
+              values_from = pland,
+              values_fill = list(pland = 0))
+```
+
+Manually re-create pland 03, since it is "lost" / missing for an unknown reason
+
+```{r}
+pland <- pland %>%
+  mutate(pland_03_deciduous_needleleaf = 1 - (pland_00_water
+                               + pland_01_evergreen_needleleaf 
+                               + pland_02_evergreen_broadleaf
+                               + pland_04_deciduous_broadleaf 
+                               + pland_05_mixed_forest
+                               + pland_06_closed_shrubland
+                               + pland_07_open_shrubland 
+                               + pland_08_woody_savanna 
+                               + pland_09_savanna
+                               + pland_10_grassland
+                               + pland_11_wetland 
+                               + pland_12_cropland 
+                               + pland_13_urban
+                               + pland_14_mosaic 
+                               + pland_15_barren))
+```
+
+Load manually downloaded elevation data, then crop to our study area
+
+```{r}
+# Load in the data
+elev <- raster("data/elevation_1KMmd_GMTEDmd.tif")
+
+# Crop to BCR 31, including a buffer for "wiggle room"
+elev <- bcr %>%
+  st_buffer(dist = 10000) %>%
+  st_transform(crs = projection(elev)) %>%
+  crop(elev, .) %>%
+  projectRaster(crs = projection(landcover))
+```
+
+Extract the elevation values that correspond to each area, then use these values to calculate mean and standard deviation of elevation in each area
+
+```{r}
+bird_buff_no_year <- ibis %>%
+  distinct(locality_id, latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = projection(elev)) %>%
+  st_buffer(dist = neighborhood_radius)
+
+locs <- st_set_geometry(bird_buff_no_year, NULL) %>%
+  mutate(id = row_number())
+
+elev_checklists <- exact_extract(elev, bird_buff_no_year, progress = FALSE) %>%
+  map_dfr(~ tibble(elevation_mean = mean(.$value, na.rm = TRUE),
+                   elevation_median = median(.$value, na.rm = TRUE),
+                   elevation_sd = sd(.$value, na.rm = TRUE),
+                   elevation_iqr = IQR(.$value, na.rm = TRUE))) %>%
+
+  bind_cols(locs, .)
+```
+
+Merge the environmental covariates together and save the dataset
+
+```{r}
+# Merge the land cover and elevation covariates
+pland_elev_checklist <- inner_join(pland, elev_checklists, by = "locality_id")
+```
+
+## Prediction Surface
+
+We will create a "prediction surface" for BCR 31 using the MODIS land cover data from 2016.
+
+First, we will create a template raster with cells of the same size as the neighborhoods we previously defined. We will also assign the value 1 to all cells within BCR 31, leaving the cells outside the Floridian peninsula empty, and then remove the empty cells.
+
+```{r}
+agg_factor <- round(2 * neighborhood_radius / res(landcover))
+
+r <- raster(landcover) %>%
+  aggregate(agg_factor)
+
+r <- bcr %>%
+  st_transform(crs = projection(r)) %>%
+  rasterize(r, field = 1) %>%
+  trim()
+
+r <- writeRaster(r, filename = "data/prediction_surface.tif", overwrite = TRUE)
+```
+
+For each cell, we will calculate the PLAND metrics using the same approach we used previously for the observation neighborhoods.
+
+First, we will get cell centers and create neighborhoods:
+
+```{r}
+r_centers <- rasterToPoints(r, spatial = TRUE) %>%
+  st_as_sf() %>%
+  transmute(id = row_number())
+
+r_cells <- st_buffer(r_centers, dist = neighborhood_radius)
+```
+
+Next, we will extract landcover values within each neighborhood, using the year of 2016.
+
+```{r}
+lc_extract_pred <- landcover[[paste0("y", 2016)]] %>%
+  exact_extract(r_cells, progress = FALSE) %>%
+  map(~ count(., landcover = value)) %>%
+  tibble(id = r_cells$id, data = .) %>%
+  unnest(data)
+```
+
+Following the above, we will calculate PLAND values across the prediction surface.
+
+```{r}
+pland_pred <- lc_extract_pred %>%
+  count(id, landcover) %>%
+  group_by(id) %>%
+  mutate(pland = n / sum(n)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  filter(!is.na(landcover))
+```
+
+As before, we will change the names to be more descriptive.
+
+```{r}
+pland_pred <- pland_pred %>%
+  inner_join(lc_names, by = "landcover") %>%
+  arrange(landcover) %>%
+  select(-landcover)
+```
+
+As before, we will transform to a wide data format and fill in implicit missing values with 0s.
+
+```{r}
+pland_pred <- pland_pred %>%
+  pivot_wider(names_from = lc_name,
+              values_from = pland,
+              values_fill = list(pland = 0)) %>%
+  mutate(year = 2016) %>%
+  select(id, year, everything())
+```
+
+Now we will join in the coordinates.
+
+```{r}
+pland_coords <- st_transform(r_centers, crs = 4326) %>%
+  st_coordinates() %>%
+  as.data.frame() %>%
+  cbind(id = r_centers$id, .) %>%
+  rename(longitude = X, latitude = Y) %>%
+  inner_join(pland_pred, by = "id")
+```
+
+We will now prepare elevation covariates for the prediction surface.
+
+```{r}
+elev_pred <- exact_extract(elev, r_cells, progress = FALSE) %>%
+  map_dfr(~ tibble(elevation_mean = mean(.$value, na.rm = TRUE),
+                   elevation_median = median(.$value, na.rm = TRUE),
+                   elevation_sd = sd(.$value, na.rm = TRUE),
+                   elevation_iqr = IQR(.$value, na.rm = TRUE))) %>%
+# Join to lookup table to get locality_id: Not sure what that means
+  bind_cols(st_drop_geometry(r_cells), .)
+```
+
+We will combine and save the PLAND and elevation covariates for the prediction surface.
+
+```{r}
+# Prediction surface covariates
+pland_elev_pred <- inner_join(pland_coords, elev_pred, by = "id")
+
+write_csv(pland_elev_pred, "data/pland_elev_prediction_surface.csv")
+```
+
+Finally, we will add a standard suite of effort covariates to every cell. In particular: the day is 6/15/16, time started is 12:00 p.m., duration is 60 minutes, distance is one kilometer, number of observers is one, and protocol type is Traveling.
+
+```{r}
+# Add a standard suite of effort covariates to the prediction surface
+pred_surface_eff <- pland_elev_pred  %>% 
+  mutate(day_of_year = yday(ymd(str_glue("2016-06-15"))),
+         time_observations_started = 12,
+         duration_minutes = 60,
+         distance_traveled_km = 1,
+         number_observers = 1,
+         protocol_type = "Traveling")
+```
+
+## Load necessary GIS data
+
+```{r}
+map_proj <- st_crs('ESRI:102003')
+
+ne_land <- read_sf("data/gis-data.gpkg", "ne_land") %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = map_proj) %>%
+  st_geometry()
+
+bcr <- read_sf("data/gis-data.gpkg", "bcr") %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = map_proj) %>%
+  st_geometry()
+
+ne_country_lines <- read_sf("data/gis-data.gpkg", "ne_country_lines") %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = map_proj) %>%
+  st_geometry()
+
+ne_state_lines <- read_sf("data/gis-data.gpkg", "ne_state_lines") %>%
+  st_set_crs(4326) %>%
+  st_transform(crs = map_proj) %>%
+  st_geometry()
+```
+
+## Wetland Plot
+
+We will now make a plot of the proportion of wetland terrain across BCR 31.
+
+```{r}
+# Use if saving the plot to PDF
+# pdf("wetland.pdf")
+
+wetland_cover <- pland_coords %>%
+# Convert to spatial features
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = projection(r)) %>%
+# Rasterize points
+  rasterize(r, field = "pland_11_wetland") %>%
+# Project for mapping
+  projectRaster(crs = st_crs('ESRI:102003')$proj4string, method = "ngb") %>%
+# Trim the empty edges of the raster
+  trim()
+
+# png(file = "pland_wetland.png")
+
+par(mar = c(0.25, 0.25, 0.25, 0.25))
+
+plot(bcr, col = NA, border = NA)
+plot(ne_land, col = "#dddddd", border = "#888888", lwd = 0.75, add = TRUE)
+    
+plot(wetland_cover, axes = FALSE, box = FALSE, col = mako(20, direction = -1), add = TRUE)
+
+  # borders
+plot(bcr, border = "#000000", col = NA, lwd = 1.5, add = TRUE)
+plot(ne_state_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+plot(ne_country_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+box()
+
+# Use if saving the plot to PDF
+# dev.off()
+```
+
+## GAM Prediction Plot
+
+Next, we will plot a map of relative abundance predictions for the white ibis made across BCR 31 using the quasi-Poisson GAM.
+
+```{r}
+# Load quasi-Poisson GAM
+load("white_ibis_gam.model")
+
+# Predict using the GAM across the study area
+pred <- predict(qpois.gam, newdata = pred_surface_eff, 
+                type = "link", 
+                se.fit = TRUE) %>% 
+  as_tibble() %>% 
+  # calculate confidence limits and back transform
+  transmute(pred_count = qpois.gam$family$linkinv(fit)) %>%
+  # add to prediction surface
+  bind_cols(pred_surface_eff, .) %>% 
+  select(latitude, longitude, pred_count)
+```
+
+Convert the dataframe to spatial features, then rasterize the points with the prediction surface raster template:
+
+```{r}
+r_pred <- pred %>% 
+  # convert to spatial features
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
+  select(pred_count) %>% 
+  st_transform(crs = projection(r)) %>% 
+  # rasterize
+  rasterize(r)
+r_pred <- r_pred[[-1]]
+
+# save the rasters
+tif_dir <- "output"
+if (!dir.exists(tif_dir)) {
+  dir.create(tif_dir)
+}
+writeRaster(r_pred[["pred_count"]], 
+            filename = file.path(tif_dir, "abundance-model_pred-count_white-ibis.tif"),
+            overwrite = TRUE)
+```
+
+Map white ibis relative abundance across BCR 31.
+
+```{r}
+# Use if saving the plots to PDF
+# pdf("gam_map.pdf") 
+
+# any expected abundances below this threshold are set to zero
+zero_threshold <- 0.05
+
+# Project predictions
+r_pred_proj <- projectRaster(r_pred, crs = map_proj$proj4string, method = "ngb")
+
+# par(mfrow = c(2, 1))
+for (nm in names(r_pred)) {
+  r_plot <- r_pred_proj[[nm]]
+  
+# Set first margin at 3.5 if knitting file in R Markdown
+# Set first margin to 5 if saving plots to PDF
+  par(mar = c(3.5, 0.25, 0.25, 0.25))
+  # set up plot area
+  plot(bcr, col = NA, border = NA)
+  plot(ne_land, col = "#dddddd", border = "#888888", lwd = 0.75, add = TRUE)
+  
+  # modified plasma palette
+  plasma_rev <- rev(plasma(25, end = 0.9))
+  gray_int <- colorRampPalette(c("#dddddd", plasma_rev[1]))
+  pal <- c(gray_int(4)[2], plasma_rev)
+  
+  # Plot relative abundance predictions
+    title <- "White Ibis Relative Abundance"
+    # set very low values to zero
+    r_plot[r_plot <= zero_threshold] <- NA
+    # log transform
+    r_plot <- log10(r_plot)
+    # breaks and legend
+    mx <- ceiling(100 * cellStats(r_plot, max)) / 100
+    mn <- floor(100 * cellStats(r_plot, min)) / 100
+    brks <- seq(mn, mx, length.out = length(pal) + 1)
+    lbl_brks <- seq(mn, mx, length.out = 5)
+    lbls <- round(10^lbl_brks, 2)
+  
+  # abundance plot
+  plot(r_plot, 
+       col = pal, breaks = brks, 
+       maxpixels = ncell(r_plot),
+       legend = FALSE, add = TRUE)
+
+  # borders
+  plot(bcr, border = "#000000", col = NA, lwd = 1.5, add = TRUE)
+  plot(ne_state_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+  plot(ne_country_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+  box()
+
+
+  # legend
+  par(new = TRUE, mar = c(0.5, 0.5, 0.5, 0.5))
+  image.plot(zlim = range(brks), legend.only = TRUE, col = pal,
+             smallplot = c(0.25, 0.75, 0.06, 0.09),
+             horizontal = TRUE,
+             axis.args = list(at = lbl_brks, 
+                              labels = lbls,
+                              fg = "black", col.axis = "black",
+                              cex.axis = 0.75, lwd.ticks = 0.5,
+                              padj = -1.5),
+             legend.args = list(text = title,
+                                side = 3, col = "black",
+                                cex = 1, line = 0))
+}
+
+# Use if saving the plots to PDF
+# dev.off()
+```
+
+## HGAM Prediction Plot
+
+Finally, we will plot a map of relative abundance predictions for the white ibis made across BCR 31 using the quasi-Poisson HGAM.
+
+We will load the white ibis quasi-Poisson HGAM.
+
+```{r}
+# Load HGAM model
+load("white_ibis_hgam.model")
+```
+
+Create predictions for relative abundance across the prediction surface:
+
+```{r}
+# Save a model matrix for the white ibis prediction surface data
+# Prediction surface data previously established with the name pred_surface_eff
+white.ibis.matrix <- predict(qpois.gam, newdata = pred_surface_eff, type = "lpmatrix")
+
+# Save the vector of coefficient estimates for white.ibis.hgam
+white.ibis.coef <- hgam.soi$fixef
+white.ibis.coef <- as.matrix(white.ibis.coef)
+
+# Generate "link" predictions
+white.ibis.link <- (white.ibis.matrix %*% white.ibis.coef)
+
+# Switch into units of response
+white.ibis.pred <- exp(white.ibis.link)
+```
+
+Attach predictions to spatial information:
+
+```{r}
+pred_2 <- white.ibis.pred %>%
+  as.tibble() %>%
+  transmute(pred_count = white.ibis.pred) %>%
+  bind_cols(pred_surface_eff, .) %>%
+  select(latitude, longitude, pred_count)
+```
+
+Convert the dataframe to spatial features, then rasterize the points with the prediction surface raster template:
+
+```{r}
+r_pred_2 <- pred_2 %>% 
+  # convert to spatial features
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>% 
+  select(pred_count) %>% 
+  st_transform(crs = projection(r)) %>% 
+  # rasterize
+  rasterize(r)
+
+r_pred_2 <- r_pred_2[[-1]]
+
+# save the rasters
+tif_dir_2 <- "output"
+if (!dir.exists(tif_dir_2)) {
+  dir.create(tif_dir_2)
+}
+writeRaster(r_pred_2[["pred_count"]], 
+            filename = file.path(tif_dir_2, "abundance-model_pred-count_white-ibis_2.tif"),
+            overwrite = TRUE)
+```
+
+Plot the map of predicted relative abundance across the prediction surface of BCR 31:
+
+```{r}
+# Use if saving the plot to PDF
+# pdf("hgam_map.pdf") 
+
+# any expected abundances below this threshold are set to zero
+zero_threshold <- 0.05
+
+# Project predictions
+r_pred_proj_2 <- projectRaster(r_pred_2, crs = map_proj$proj4string, method = "ngb")
+
+  r_plot_2 <- r_pred_proj_2
+  
+# Set first margin at 3.5 if knitting file in R Markdown
+# Set first margin to 5 if saving plots to PDF
+  par(mar = c(3.5, 0.25, 0.25, 0.25))
+  # set up plot area
+  plot(bcr, col = NA, border = NA)
+  plot(ne_land, col = "#dddddd", border = "#888888", lwd = 0.75, add = TRUE)
+  
+  # modified plasma palette
+  plasma_rev <- rev(plasma(25, end = 0.9))
+  gray_int <- colorRampPalette(c("#dddddd", plasma_rev[1]))
+  pal <- c(gray_int(4)[2], plasma_rev)
+  
+  # abundance, part 1
+    title <- "White Ibis Relative Abundance"
+    # set very low values to zero
+    r_plot_2[r_plot_2 <= zero_threshold] <- NA
+    # log transform
+    r_plot_2 <- log10(r_plot_2)
+    # breaks and legend
+    mx <- ceiling(100 * cellStats(r_plot_2, max)) / 100
+    mn <- floor(100 * cellStats(r_plot_2, min)) / 100
+    brks <- seq(mn, mx, length.out = length(pal) + 1)
+    lbl_brks <- seq(mn, mx, length.out = 5)
+    lbls <- round(10^lbl_brks, 2)
+  
+  # abundance, part 2
+  plot(r_plot_2, 
+       col = pal, breaks = brks, 
+       maxpixels = ncell(r_plot_2),
+       legend = FALSE, add = TRUE)
+
+  # borders
+  plot(bcr, border = "#000000", col = NA, lwd = 1.5, add = TRUE)
+  plot(ne_state_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+  plot(ne_country_lines, col = "#ffffff", lwd = 0.75, add = TRUE)
+  box()
+
+  # legend
+  par(new = TRUE, mar = c(0.5, 0.5, 0.5, 0.5))
+  image.plot(zlim = range(brks), legend.only = TRUE, col = pal,
+             smallplot = c(0.25, 0.75, 0.06, 0.09),
+             horizontal = TRUE,
+             axis.args = list(at = lbl_brks, 
+                              labels = lbls,
+                              fg = "black", col.axis = "black",
+                              cex.axis = 0.75, lwd.ticks = 0.5,
+                              padj = -1.5),
+             legend.args = list(text = title,
+                                side = 3, col = "black",
+                                cex = 1, line = 0))
+
+# Use if saving the plot to PDF
+# dev.off()
+```
+
