@@ -1,0 +1,296 @@
+---
+title: 'Part 7: Producing Effect Displays'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(MODIS)
+library(exactextractr)
+library(viridis)
+library(tidyverse)
+
+library(dggridR)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(pscl)
+library(MASS)
+library(ggpubr)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+# Part A: Effect Displays
+
+## Load the data and models
+
+```{r}
+# Load training data
+ibis <- read_csv("data/ebd_white_ibis_train.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_white_ibis_2017.csv", show_col_types = FALSE)
+
+# Load GAM
+load("white_ibis_gam.model")
+
+# Load HGAM
+load("white_ibis_hgam.model")
+```
+
+## Histograms for selected covariates
+
+### Time Observations Started
+
+```{r}
+ggplot(ibis, aes(x = time_observations_started)) +
+  geom_histogram()
+```
+
+We will set the range of "time observations started" values in its effect display from the 0.01 percentile to the 0.99 percentile, as there are both extreme low and extreme high values for this covariate.
+
+### Wetland
+
+```{r}
+ggplot(ibis, aes(x = pland_11_wetland)) +
+  geom_histogram()
+```
+
+There are extreme values of wetland on the right-hand side of the distribution. We will set the range of the effect display for wetland from its minimum value to its 0.99 percentile. 
+
+### Urban
+
+```{r}
+ggplot(ibis, aes(x = pland_13_urban)) +
+  geom_histogram()
+```
+
+The distribution of the urban covariate does not show any unusual extreme low or high values. The range of the effect display for urban will run from the covariate's minimum to its maximum.
+
+## Effect displays for GAM
+
+### Time Observations Started / Hours Since Midnight
+
+```{r}
+tos.01 <- as.numeric(quantile(ibis$time_observations_started, probs = 0.01))
+tos.99 <- as.numeric(quantile(ibis$time_observations_started, probs = 0.99))
+tos_seq <- seq(tos.01, tos.99, length.out = 300)
+
+tos_data <- ibis %>%
+  select(duration_minutes, distance_traveled_km, number_observers, pland_02_evergreen_broadleaf, pland_04_deciduous_broadleaf, pland_08_woody_savanna, pland_10_grassland, pland_11_wetland, pland_12_cropland, pland_13_urban, pland_14_mosaic, elevation_mean, elevation_sd) %>%
+  summarize_all(median, na.ram = TRUE) %>%
+  ungroup() %>%
+  cbind(time_observations_started = tos_seq)
+```
+
+```{r}
+# Then predict counts using GAM model
+tos_link <- predict(qpois.gam, newdata = tos_data,
+                    type = "link",
+                    se.fit = TRUE)
+
+tos_predictions <- as_tibble(tos_link) %>% transmute(time_observations_started = tos_seq,
+            pred_counts = qpois.gam$family$linkinv(tos_link$fit))
+```
+
+```{r}
+# Generate the effect display plot
+plot1 <- tos_predictions %>%
+ggplot(aes(x = time_observations_started, y = pred_counts)) +
+  geom_line() +
+  labs(x = "Hours since midnight, GAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 2.25)
+```
+
+### Wetland
+
+```{r}
+# Create a vector of covariates with a range of "pland 11 (wetland)" values
+# Range is from the minimum of pland 11 to the 0.99 percentile of pland 11
+min.11 <- min(ibis$pland_11_wetland)
+percentile.11 <- as.numeric(quantile(ibis$pland_11_wetland, probs = 0.99))
+
+pland_11_seq <- seq(min.11, percentile.11, length.out = 300)
+
+# Create a dataframe: all other covariates will have median values
+pland_11_data <- ibis %>%
+  select(time_observations_started, duration_minutes, distance_traveled_km, number_observers, pland_02_evergreen_broadleaf, pland_04_deciduous_broadleaf, pland_08_woody_savanna, pland_10_grassland, pland_12_cropland, pland_13_urban, pland_14_mosaic, elevation_mean, elevation_sd) %>%
+  summarize_all(median, na.ram = TRUE) %>%
+  ungroup() %>%
+  cbind(pland_11_wetland = pland_11_seq)
+```
+
+```{r}
+# Predict counts using GAM
+pland_11_link <- predict(qpois.gam, newdata = pland_11_data,
+                    type = "link",
+                    se.fit = TRUE)
+
+pland_11_predictions <- as_tibble(pland_11_link) %>% transmute(pland_11_wetland = pland_11_seq,
+            pred_counts = qpois.gam$family$linkinv(pland_11_link$fit))
+```
+
+```{r}
+# Generate the effect display plot
+plot7 <- pland_11_predictions %>%
+ggplot(aes(x = pland_11_wetland, y = pred_counts)) +
+  geom_line() +
+  labs(x = "Proportion of wetland terrain, GAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 4)
+```
+
+### Urban
+
+```{r}
+# Create a vector of covariates with a range of "pland 13 (urban)" values
+# Range is from the minimum of pland 13 to the maximum value of pland 13
+min.13 <- min(ibis$pland_13_urban)
+max.13 <- max(ibis$pland_13_urban)
+
+pland_13_seq <- seq(min.13, max.13, length.out = 300)
+
+# Create a dataframe: all other covariates will have median values
+pland_13_data <- ibis %>%
+  select(time_observations_started, duration_minutes, distance_traveled_km, number_observers, pland_02_evergreen_broadleaf, pland_04_deciduous_broadleaf, pland_08_woody_savanna, pland_10_grassland, pland_11_wetland, pland_12_cropland, pland_14_mosaic, elevation_mean, elevation_sd) %>%
+  summarize_all(median, na.ram = TRUE) %>%
+  ungroup() %>%
+  cbind(pland_13_urban = pland_13_seq)
+```
+
+```{r}
+# Predict counts using GAM
+pland_13_link <- predict(qpois.gam, newdata = pland_13_data,
+                    type = "link",
+                    se.fit = TRUE)
+
+pland_13_predictions <- as_tibble(pland_13_link) %>% transmute(pland_13_urban = pland_13_seq,
+            pred_counts = qpois.gam$family$linkinv(pland_13_link$fit))
+```
+
+```{r}
+# Generate the effect display plot
+plot8 <- pland_13_predictions %>%
+ggplot(aes(x = pland_13_urban, y = pred_counts)) +
+  geom_line() +
+  labs(x = "Proportion of urban terrain, GAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 2.25)
+```
+
+## Effect displays for HGAM
+
+### Time Observations Started / Hours Since Midnight
+
+```{r}
+# Save a model matrix for tos_data
+tos.matrix <- predict(qpois.gam, newdata = tos_data, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- hgam.soi$fixef
+hgam.coef <- as.matrix(hgam.coef)
+
+# Generate "link" predictions
+tos_link <- (tos.matrix %*% hgam.coef)
+
+# Prepare the tibble
+time_observations_started <- tos_seq
+tos_pred <- exp(tos_link)
+
+tos_predictions <- tibble(time_observations_started, tos_pred)
+```
+
+```{r}
+# Generate the effect display plot
+plot01 <- tos_predictions %>%
+ggplot(aes(x = time_observations_started, y = tos_pred)) +
+  geom_line() +
+  labs(x = "Hours since midnight, HGAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 2.25)
+```
+
+### Wetland
+
+```{r}
+# Save a model matrix for pland_11_data
+pland11.matrix <- predict(qpois.gam, newdata = pland_11_data, type = "lpmatrix")
+
+# Generate "link" predictions
+pland_11_link <- (pland11.matrix %*% hgam.coef)
+
+# Prepare the tibble
+pland_11_wetland <- pland_11_seq
+
+pland_11_pred <- exp(pland_11_link)
+
+pland_11_predictions <- tibble(pland_11_wetland, pland_11_pred)
+```
+
+```{r}
+# Generate the effect display plot
+plot07 <- pland_11_predictions %>%
+ggplot(aes(x = pland_11_wetland, y = pland_11_pred)) +
+  geom_line() +
+  labs(x = "Proportion of wetland terrain, HGAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 4)
+```
+
+### Urban
+
+```{r}
+# Save a model matrix for pland_13_data
+pland13.matrix <- predict(qpois.gam, newdata = pland_13_data, type = "lpmatrix")
+
+# Generate "link" predictions
+pland_13_link <- (pland13.matrix %*% hgam.coef)
+
+# Prepare the tibble
+pland_13_urban <- pland_13_seq
+
+pland_13_pred <- exp(pland_13_link)
+
+pland_13_predictions <- tibble(pland_13_urban, pland_13_pred)
+```
+
+```{r}
+# Generate the effect display plot
+plot08 <- pland_13_predictions %>%
+ggplot(aes(x = pland_13_urban, y = pland_13_pred)) +
+  geom_line() +
+  labs(x = "Proportion of urban terrain, HGAM") +
+  theme(axis.title.y = element_blank()) +
+  ylim(0, 2.25)
+```
+
+## Generate final image
+
+```{r}
+grob <- arrangeGrob(plot1, plot7, plot8, plot01, plot07, plot08, ncol = 3, nrow = 2, top = text_grob("Effect of Selected Covariates on White Ibis Relative Abundance", size = 16), left = textGrob("Relative abundance", rot = 90))
+
+ggsave(file="effect_displays_final.png", grob, width = 10, height = 4)
+```

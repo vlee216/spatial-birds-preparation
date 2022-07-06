@@ -1,0 +1,1131 @@
+---
+title: 'Part 6: Investigating Zeros and Nonzeros'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(dggridR)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(tidyverse)
+library(pscl)
+library(MASS)
+library(numform)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+## White Ibis
+
+### Load the data
+
+```{r}
+# Load training data
+ibis <- read_csv("data/ebd_white_ibis_train.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_white_ibis_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Filter test data for zeros
+ibis.2017.zeros <- filter(ibis.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(ibis.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+ibis.2017.nonzeros <- filter(ibis.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(ibis.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("white_ibis_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, ibis.2017, type = "response") %>%
+  tibble(family = "White Ibis GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, ibis.2017.zeros, type = "response") %>%
+  tibble(family = "White Ibis GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, ibis.2017.nonzeros, type = "response") %>%
+  tibble(family = "White Ibis GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("white_ibis_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = ibis.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "White Ibis HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = ibis.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "White Ibis HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = ibis.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "White Ibis HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Glossy Ibis
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+ibis <- read_csv("data/ebd_glossy_ibis_train.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_glossy_ibis_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Filter test data for zeros
+ibis.2017.zeros <- filter(ibis.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(ibis.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+ibis.2017.nonzeros <- filter(ibis.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(ibis.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("glossy_ibis_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Glossy Ibis GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, ibis.2017.zeros, type = "response") %>%
+  tibble(family = "Glossy Ibis GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, ibis.2017.nonzeros, type = "response") %>%
+  tibble(family = "Glossy Ibis GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("glossy_ibis_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = ibis.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Glossy Ibis HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = ibis.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Glossy Ibis HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = ibis.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Glossy Ibis HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Great Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_great_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_great_egret_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Filter test data for zeros
+egret.2017.zeros <- filter(egret.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(egret.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+egret.2017.nonzeros <- filter(egret.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(egret.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("great_egret_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Great Egret GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, egret.2017.zeros, type = "response") %>%
+  tibble(family = "Great Egret GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, egret.2017.nonzeros, type = "response") %>%
+  tibble(family = "Great Egret GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("great_egret_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Great Egret HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = egret.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Great Egret HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = egret.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Great Egret HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Cattle Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_cattle_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_cattle_egret_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Filter test data for zeros
+egret.2017.zeros <- filter(egret.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(egret.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+egret.2017.nonzeros <- filter(egret.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(egret.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("cattle_egret_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Cattle Egret GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, egret.2017.zeros, type = "response") %>%
+  tibble(family = "Cattle Egret GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, egret.2017.nonzeros, type = "response") %>%
+  tibble(family = "Cattle Egret GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("cattle_egret_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Cattle Egret HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = egret.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Cattle Egret HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = egret.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Cattle Egret HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Snowy Egret
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+egret <- read_csv("data/ebd_snowy_egret_train.csv", show_col_types = FALSE)
+
+# Load test data
+egret.2017 <- read_csv("data/ebd_snowy_egret_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Filter test data for zeros
+egret.2017.zeros <- filter(egret.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(egret.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+egret.2017.nonzeros <- filter(egret.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(egret.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("snowy_egret_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Snowy Egret GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, egret.2017.zeros, type = "response") %>%
+  tibble(family = "Snowy Egret GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, egret.2017.nonzeros, type = "response") %>%
+  tibble(family = "Snowy Egret GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("snowy_egret_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = egret.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Snowy Egret HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = egret.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Snowy Egret HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = egret.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Snowy Egret HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Great Blue Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_gbh_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_gbh_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Filter test data for zeros
+heron.2017.zeros <- filter(heron.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(heron.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+heron.2017.nonzeros <- filter(heron.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(heron.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("gbh_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Great Blue Heron GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, heron.2017.zeros, type = "response") %>%
+  tibble(family = "Great Blue Heron GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, heron.2017.nonzeros, type = "response") %>%
+  tibble(family = "Great Blue Heron GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("gbh_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Great Blue Heron HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = heron.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Great Blue Heron HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = heron.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Great Blue Heron HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Little Blue Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_lbh_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_lbh_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Filter test data for zeros
+heron.2017.zeros <- filter(heron.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(heron.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+heron.2017.nonzeros <- filter(heron.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(heron.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("lbh_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Little Blue Heron GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, heron.2017.zeros, type = "response") %>%
+  tibble(family = "Little Blue Heron GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, heron.2017.nonzeros, type = "response") %>%
+  tibble(family = "Little Blue Heron GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("lbh_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Little Blue Heron HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = heron.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Little Blue Heron HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = heron.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Little Blue Heron HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+
+## Green Heron
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+as_factor <- forcats::as_factor
+```
+
+### Load the data
+
+```{r}
+# Load training data
+heron <- read_csv("data/ebd_green_heron_train.csv", show_col_types = FALSE)
+
+# Load test data
+heron.2017 <- read_csv("data/ebd_green_heron_2017.csv", show_col_types = FALSE)
+# and select for only the count values
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Filter test data for zeros
+heron.2017.zeros <- filter(heron.2017, bird_count == 0)
+# and select for only the count values
+obs.count.zeros <- select(heron.2017.zeros, obs = bird_count)
+
+# Filter test data for nonzeros
+heron.2017.nonzeros <- filter(heron.2017, bird_count > 0)
+# and select for only the count values
+obs.count.nonzeros <- select(heron.2017.nonzeros, obs = bird_count)
+```
+
+### Generate GAM predictions
+
+```{r}
+# Load the quasi-Poisson GAM
+load("green_heron_gam.model")
+
+# Generate GAM predictions over full test set
+gam.pred1 <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Green Heron GAM, all", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate predictions over zeros
+gam.pred2 <- predict(qpois.gam, heron.2017.zeros, type = "response") %>%
+  tibble(family = "Green Heron GAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+
+# Generate predictions over nonzeros
+gam.pred3 <- predict(qpois.gam, heron.2017.nonzeros, type = "response") %>%
+  tibble(family = "Green Heron GAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Generate HGAM predictions, full test set
+
+```{r}
+# Load the quasi-Poisson HGAM
+load("green_heron_hgam.model")
+
+# Save a model matrix for 2017 test data
+matrix.17 <- predict(qpois.gam, newdata = heron.2017, type = "lpmatrix")
+
+# Save the vector of coefficient estimates
+hgam.coef <- as.matrix(hgam.soi$fixef)
+
+# Generate predictions (link)
+link.17 <- (matrix.17 %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred1 <- as.vector(pred.17) %>%
+  tibble(family = "Green Heron HGAM, all", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+### Generate HGAM predictions, zeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.zeros <- predict(qpois.gam, newdata = heron.2017.zeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.zeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred2 <- as.vector(pred.17) %>%
+  tibble(family = "Green Heron HGAM, zeros", pred = .) %>%
+  bind_cols(obs.count.zeros)
+```
+
+### Generate HGAM predictions, nonzeros only
+
+```{r}
+# Save a model matrix for 2017 test data
+matrix.17.nonzeros <- predict(qpois.gam, newdata = heron.2017.nonzeros, type = "lpmatrix")
+
+# Generate predictions (link)
+link.17 <- (matrix.17.nonzeros %*% hgam.coef)
+
+# Put in units of the response
+pred.17 <- exp(link.17)
+
+# Build tibble with predictions and observed counts
+hgam.pred3 <- as.vector(pred.17) %>%
+  tibble(family = "Green Heron HGAM, nonzeros", pred = .) %>%
+  bind_cols(obs.count.nonzeros)
+```
+
+### Calculate MAD
+
+```{r}
+# Bind the predictions
+predictions <- bind_rows(gam.pred1, hgam.pred1, gam.pred2, hgam.pred2, gam.pred3, hgam.pred3) %>%
+  mutate(family = as_factor(family))
+```
+
+```{r}
+# Calculate MAD and corresponding SD for each set of predictions
+mad.tibble <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Print the table
+mad.tibble
+```
+

@@ -1,0 +1,1775 @@
+---
+title: 'Part 4: Non-spatial Pipeline'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(dggridR)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(tidyverse)
+library(pscl)
+library(MASS)
+
+# for the round2() function
+library(numform)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+# White Ibis
+
+## Load the data
+
+```{r}
+# Training data
+ibis.2016 <- read_csv("data/ebd_white_ibis_2016.csv", show_col_types = FALSE)
+
+# Test data
+ibis.2017 <- read_csv("data/ebd_white_ibis_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish the initial quasi-Poisson model needed for influential data analysis
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+qpois.1 <- glm(glm.formula.2, family = "quasipoisson", data = ibis.2016)
+```
+
+### Round 1
+
+```{r}
+# Plot a Cook's distance plot
+plot(qpois.1, which = 4)
+
+# Remove the three marked observations
+ibis.2 <- ibis.2016[-c(1184, 3459, 3728),]
+
+# Fit a new quasi-Poisson GLM
+qpois.2 <- glm(glm.formula.2, family = "quasipoisson", data = ibis.2)
+
+# R-Squared for quasi-Poisson 1
+sum.1 <- summary(qpois.1)
+round2(1 - (sum.1$deviance/sum.1$null.deviance), 4)
+
+# R-Squared for quasi-Poisson 2
+sum.2 <- summary(qpois.2)
+round2(1 - (sum.2$deviance/sum.2$null.deviance), 4)
+
+# Amount of change
+round2((1 - (sum.2$deviance/sum.2$null.deviance)) - (1 - (sum.1$deviance/sum.1$null.deviance)), 4)
+```
+
+The amount of change between these two models’ values for R-squared is fairly small. It is possible that we have achieved stabilization in our modeling process. To further investigate, we will compare the summaries for these two models.
+
+```{r}
+# Compare the summaries for the first and second quasi-Poisson GLMs
+summary(qpois.1)
+summary(qpois.2)
+```
+
+The first model marks number of observers as significant, while the second model does not. The second model marks elevation mean as significant, while the first one does not. Additionally, for both covariates the non-significant p-value is not close to the 0.05 threshold. This is evidence that dropping the three marked observations did have an outsize impact on our modeling. 
+
+We will continue performing influential data analysis.
+
+### Round 2
+
+```{r}
+# Plot a Cook's distance plot
+plot(qpois.2, which = 4)
+
+# Drop the three marked observations
+ibis.3 <- ibis.2[-c(671, 1215, 3326),]
+
+# Fit a new quasi-Poisson GLM
+qpois.3 <- glm(glm.formula.2, family = "quasipoisson", data = ibis.3)
+
+# R-Squared for quasi-Poisson 2
+round2(1 - (sum.2$deviance/sum.2$null.deviance), 4)
+
+# R-Squared for quasi-Poisson 3
+sum.3 <- summary(qpois.3)
+round2(1 - (sum.3$deviance/sum.3$null.deviance), 4)
+
+# Amount of change
+round2((1 - (sum.3$deviance/sum.3$null.deviance)) - (1 - (sum.2$deviance/sum.2$null.deviance)), 4)
+```
+
+The amount of change between these two models’ values for R-squared is fairly small. It is possible that we have achieved stabilization in our modeling process. To further investigate, we will compare the summaries for these two models.
+
+```{r}
+# Compare the summaries for the second and third quasi-Poisson GLMs
+summary(qpois.2)
+summary(qpois.3)
+```
+
+Both models mark duration in minutes, distance traveled, pland 11 (wetland), pland 13 (urban), and elevation mean as statistically significant predictors for a 0.05 threshold. The second model marks pland 08 (woody savanna) as statistically significant, whereas the third model does not. However, the p-values for this covariate are fairly similar: the second model produces a p-value of 0.046, and the third model produces a p-value of 0.068.
+
+Additionally, for all of the predictors mentioned above, the coefficient estimates are similar between the two models.
+
+We conclude that we have achieved stabilization in the modeling process. We will now proceed forard with the `ibis.2` subset.
+
+```{r}
+ibis <- ibis.2
+
+# Let's save it as a CSV file so we have access to it later
+write_csv(ibis, "data/ebd_white_ibis_train.csv", na = "")
+```
+
+## Exploratory data anlaysis
+
+```{r}
+# Print histogram of count data
+ibis %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+```
+
+```{r}
+#	Print bar plot of 0 through 25 counts
+ibis %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+##	Fit a basic Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = ibis)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+```
+
+```{r}
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+##	Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = ibis)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = ibis)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = ibis)
+```
+
+##	Examine each covariate to see if it has more than 50 values (for the GAM formula)
+
+```{r}
+# These covariates all have more than 50 unique values
+# Fit nonlinearly
+
+length(unique(ibis$time_observations_started)) > 50
+
+length(unique(ibis$duration_minutes)) > 50
+
+length(unique(ibis$distance_traveled_km)) > 50
+
+length(unique(ibis$pland_02_evergreen_broadleaf)) > 50
+
+length(unique(ibis$pland_08_woody_savanna)) > 50
+
+length(unique(ibis$pland_10_grassland)) > 50
+
+length(unique(ibis$pland_11_wetland)) > 50
+
+length(unique(ibis$pland_13_urban)) > 50
+
+length(unique(ibis$elevation_mean)) > 50
+
+length(unique(ibis$elevation_sd)) > 50
+```
+
+```{r}
+# These covariates all have fewer than 50 unique values
+# Fit linearly
+
+length(unique(ibis$number_observers)) > 50
+
+length(unique(ibis$pland_04_deciduous_broadleaf)) > 50
+
+length(unique(ibis$pland_12_cropland)) > 50
+
+length(unique(ibis$pland_14_mosaic)) > 50
+```
+
+##	Create the GAM formula and fit the GAMs
+
+```{r}
+# Use K = 5 for all the smoothing spline covariates
+# Use K = 7 for the cyclic cubic covariate
+
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+```
+
+```{r}
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = ibis,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = ibis,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = ibis,
+              family = "nb",
+              knots = time_knots)
+```
+
+##	Generate predictions for the six models using 2017 test data
+
+```{r}
+# Select the ibis count values from the test set of 2017 data
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Generate quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate  negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Generate negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+```
+
+```{r}
+# Bring together all six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+
+## Check: If TRUE, then number of predictions generated is equal to the number of observations in ibis.2017
+length(qpois.glm.pred$pred) == nrow(ibis.2017)
+```
+
+##	Calculate MAD values for the six models
+
+```{r}
+# Calculate MAD by model type
+white.ibis.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows to be in order
+white.ibis.mad <- white.ibis.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table for future use
+save(white.ibis.mad, file = "data/white_ibis_mad.Rda")
+
+# Print the table
+white.ibis.mad
+```
+
+## Save the quasi-Poisson GAM fit to call on later
+
+```{r}
+# Here is the summary printout for the quasi-Poisson GAM
+summary(qpois.gam)
+
+# Save the quasi-Poisson GAM
+save(qpois.gam, file = "white_ibis_gam.model")
+```
+
+# Glossy Ibis
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+ibis.2016 <- read_csv("data/ebd_glossy_ibis_2016.csv", show_col_types = FALSE)
+
+# Test data
+ibis.2017 <- read_csv("data/ebd_glossy_ibis_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Remove the first set of three marked observations
+ibis.2 <- ibis.2016[-c(668, 1815, 3319),]
+
+# Remove the second set of three marked observations
+ibis.3 <- ibis.2[-c(1075, 3370, 3533),]
+
+# Remove the third set of three marked observations
+ibis.4 <- ibis.3[-c(359, 1220, 3093),]
+
+# Stability in the modeling process achieved with ibis.4
+ibis <- ibis.4
+
+# Let's save it as a CSV file so that we have access to it later
+write_csv(ibis, "data/ebd_glossy_ibis_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+ibis %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+ibis %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = ibis)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = ibis)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = ibis)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = ibis)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = ibis,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = ibis,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = ibis,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate predictions using test data
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(ibis.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, ibis.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, ibis.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+glossy.ibis.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+glossy.ibis.mad <- glossy.ibis.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(glossy.ibis.mad, file = "data/glossy_ibis_mad.Rda")
+
+# Print the table
+glossy.ibis.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file="glossy_ibis_gam.model")
+```
+
+# Great Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+egret.2016 <- read_csv("data/ebd_great_egret_2016.csv", show_col_types = FALSE)
+
+# Test data
+egret.2017 <- read_csv("data/ebd_great_egret_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Drop the first three marked observations
+egret.2 <- egret.2016[-c(1073, 2851, 3501),]
+
+# Drop the second three marked observations
+egret.3 <- egret.2[-c(860, 1084, 1217),]
+
+# Stability in the model process achieved with egret.3
+egret <- egret.3
+
+# Let's save it as a CSV file so that we have access to it later
+write_csv(egret, "data/ebd_great_egret_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+egret %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+egret %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = egret)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = egret)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = egret)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = egret)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = egret,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = egret,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = egret,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate predictions using test data
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+great.egret.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+great.egret.mad <- great.egret.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(great.egret.mad, file = "data/great_egret_mad.Rda")
+
+# Print the table
+great.egret.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file="great_egret_gam.model")
+```
+
+# Cattle Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+egret.2016 <- read_csv("data/ebd_cattle_egret_2016.csv", show_col_types = FALSE)
+
+# Test data
+egret.2017 <- read_csv("data/ebd_cattle_egret_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Drop the first set of three marked observations
+egret.2 <- egret.2016[-c(164, 2904, 3079),]
+
+# Stability in the modeling process achieved with egret.2
+egret <- egret.2
+
+# Let's save it as a CSV file so that we have access to it later
+write_csv(egret, "data/ebd_cattle_egret_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+egret %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+egret %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = egret)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = egret)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = egret)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = egret)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = egret,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = egret,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = egret,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate predictions using test data
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+cattle.egret.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+cattle.egret.mad <- cattle.egret.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(cattle.egret.mad, file = "data/cattle_egret_mad.Rda")
+
+# Print the table
+cattle.egret.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file = "cattle_egret_gam.model")
+```
+
+# Snowy Egret
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+egret.2016 <- read_csv("data/ebd_snowy_egret_2016.csv", show_col_types = FALSE)
+
+# Test data
+egret.2017 <- read_csv("data/ebd_snowy_egret_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Drop the first set of three marked observations
+egret.2 <- egret.2016[-c(1089, 3299, 3348),]
+
+# Stability in the modeling process achieved with egret.2
+egret <- egret.2
+
+# Save as a CSV file for future access
+write_csv(egret, "data/ebd_snowy_egret_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+egret %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+egret %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = egret)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = egret)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = egret)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = egret)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = egret,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = egret,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = egret,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate predictions using test data
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(egret.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, egret.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, egret.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, egret.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+snowy.egret.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+snowy.egret.mad <- snowy.egret.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(snowy.egret.mad, file = "data/snowy_egret_mad.Rda")
+
+# Print the table
+snowy.egret.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file = "snowy_egret_gam.model")
+```
+
+# Great Blue Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+heron.2016 <- read_csv("data/ebd_gbh_2016.csv", show_col_types = FALSE)
+
+# Test data
+heron.2017 <- read_csv("data/ebd_gbh_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Drop the first set of three marked observations
+heron.2 <- heron.2016[-c(1088, 1221, 3412),]
+
+# Drop the second set of three marked observations
+heron.3 <- heron.2[-c(280, 1075, 2857),]
+
+# Stability in the modeling process achieved with heron.3
+heron <- heron.3
+
+# Let's save it as a CSV file so that we have access to it later
+write_csv(heron, "data/ebd_gbh_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+heron %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+heron %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = heron)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = heron)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = heron)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = heron)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = heron,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = heron,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = heron,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate predictions using test data
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+gbh.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+gbh.mad <- gbh.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(gbh.mad, file = "data/gbh_mad.Rda")
+
+# Print the table
+gbh.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file="gbh_gam.model")
+```
+
+# Little Blue Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+heron.2016 <- read_csv("data/ebd_lbh_2016.csv", show_col_types = FALSE)
+
+# Test data
+heron.2017 <- read_csv("data/ebd_lbh_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Drop the first set of three marked observations
+heron.2 <- heron.2016[-c(1222, 1251, 2863),]
+  
+# Drop the second set of three marked observations
+heron.3 <- heron.2[-c(1076, 1088, 1134),]
+  
+# Drop the third set of three marked observations
+heron.4 <- heron.3[-c(1088, 3513, 3660),]
+
+# Drop the fourth set of three marked observations
+heron.5 <- heron.4[-c(1075, 1125, 1728),]
+  
+# Stability in the modeling process achieved with heron.5
+heron <- heron.5
+
+# Let's save it as a CSV file so that we have access to it later
+write_csv(heron, "data/ebd_lbh_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+heron %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+heron %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = heron)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = heron)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = heron)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = heron)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = heron,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = heron,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = heron,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate Predictions
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+lbh.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+lbh.mad <- lbh.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(lbh.mad, file = "data/lbh_mad.Rda")
+
+# Print the table
+lbh.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file="lbh_gam.model")
+```
+
+# Green Heron
+
+## Clear the workspace
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load the data
+
+```{r}
+# Training data
+heron.2016 <- read_csv("data/ebd_green_heron_2016.csv", show_col_types = FALSE)
+
+# Test data
+heron.2017 <- read_csv("data/ebd_green_heron_2017.csv", show_col_types = FALSE)
+```
+
+## Influential data analysis
+
+```{r}
+# Establish glm.formula.2
+glm.formula.2 <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Modeling stability achieved with the full dataset
+heron <- heron.2016
+
+# Let's save it as a CSV file so that it's in the same convention as the other species
+write_csv(heron, "data/ebd_green_heron_train.csv", na = "")
+```
+
+## Exploratory data analysis
+
+```{r}
+# Print histogram of count data
+heron %>%
+  ggplot(aes(x = bird_count)) +
+  geom_histogram()
+
+# Print bar plot of 0 through 25 counts
+heron %>%
+  filter(bird_count <= 25) %>%
+  ggplot(aes(x = bird_count)) +
+  geom_bar()
+```
+
+## Fit a Poisson GLM
+
+```{r}
+# Fit a Poisson GLM
+pois.glm <- glm(glm.formula.2, family = "poisson", data = heron)
+
+# Print the summary
+pois.glm.summary <- summary(pois.glm)
+pois.glm.summary
+
+# Calculate residual deviance divided by residual df
+round2(pois.glm.summary$deviance/pois.glm.summary$df.residual, 3)
+```
+
+## Fit the other three GLMs
+
+```{r}
+# Fit a quasi-Poisson GLM
+qpois.glm <- glm(glm.formula.2, family = "quasipoisson", data = heron)
+
+# Print the summary (to observe dispersion parameter)
+summary(qpois.glm)
+
+# Fit a zero-inflated Poisson GLM
+zip.glm <- zeroinfl(glm.formula.2, data = heron)
+
+# Fit a negative binomial GLM
+nb.glm <- glm.nb(glm.formula.2, data = heron)
+```
+
+## Fit the GAMs
+
+```{r}
+# Establish the GAM formula
+gam.formula <- bird_count ~
+  s(time_observations_started, bs = "cc", k = 7) +
+  s(duration_minutes, k = 5) +
+  s(distance_traveled_km, k = 5) +
+  number_observers +
+  s(pland_02_evergreen_broadleaf, k = 5) +
+  pland_04_deciduous_broadleaf +
+  s(pland_08_woody_savanna, k = 5) +
+  s(pland_10_grassland, k = 5) +
+  s(pland_11_wetland, k = 5) +
+  pland_12_cropland +
+  s(pland_13_urban, k = 5) +
+  pland_14_mosaic +
+  s(elevation_mean, k = 5) +
+  s(elevation_sd, k = 5)
+
+# Establish the time knots
+time_knots <- list(time_observations_started = seq(0, 24, length.out = 7))
+
+# Fit a quasi-Poisson GAM
+qpois.gam <- gam(gam.formula,
+                 data = heron,
+                 family = "quasipoisson",
+                 knots = time_knots)
+
+# Fit a zero-inflated (hurdle) GAM
+zip.gam <- gam(gam.formula,
+               data = heron,
+               family = "ziP",
+               knots = time_knots)
+
+# Fit a negative binomial GAM
+nb.gam <- gam(gam.formula,
+              data = heron,
+              family = "nb",
+              knots = time_knots)
+```
+
+## Generate Predictions
+
+```{r}
+# Select the count values from the test set of 2017 data
+obs.count <- select(heron.2017, obs = bird_count)
+
+# Quasi-Poisson GLM predictions
+qpois.glm.pred <- predict(qpois.glm, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated Poisson GLM predictions
+zip.glm.pred <- predict(zip.glm, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GLM predictions
+nb.glm.pred <- predict(nb.glm, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GLM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Quasi-Poisson GAM predictions
+qpois.gam.pred <- predict(qpois.gam, heron.2017, type = "response") %>%
+  tibble(family = "Quasi-Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Zero-inflated (hurdle) GAM predictions
+zip.gam.pred <- predict(zip.gam, heron.2017, type = "response") %>%
+  tibble(family = "Zero-Inflated Poisson GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Negative binomial GAM predictions
+nb.gam.pred <- predict(nb.gam, heron.2017, type = "response") %>%
+  tibble(family = "Negative Binomial GAM", pred = .) %>%
+  bind_cols(obs.count)
+
+# Bring together the six sets of predictions
+predictions <- bind_rows(qpois.glm.pred, zip.glm.pred, nb.glm.pred, qpois.gam.pred, zip.gam.pred, nb.gam.pred) %>%
+  mutate(family = as.factor(family))
+```
+
+## Calculate MAD values
+
+```{r}
+# Calculate MAD by model type
+green.heron.mad <- predictions %>% 
+  group_by(family) %>% 
+  summarise(mad = mean(abs(obs - pred), na.rm = TRUE),
+            sd = sd(abs(obs - pred))) %>% 
+  ungroup()
+
+# Reorder the rows
+green.heron.mad <- green.heron.mad %>%
+  mutate(family = factor(family, levels = c("Quasi-Poisson GLM", "Zero-Inflated Poisson GLM", "Negative Binomial GLM", "Quasi-Poisson GAM", "Zero-Inflated Poisson GAM", "Negative Binomial GAM"))) %>%
+  arrange(family)
+
+# Save the table
+save(green.heron.mad, file = "data/green_heron_mad.Rda")
+
+# Print the table
+green.heron.mad
+```
+
+## Save the quasi-Poisson GAM
+
+```{r}
+# Print summary
+summary(qpois.gam)
+
+# Save the quasi-poisson GAM fit to call on later
+save(qpois.gam, file="green_heron_gam.model")
+```

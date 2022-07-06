@@ -1,0 +1,659 @@
+---
+title: 'Part 2: Adding Environmental Data'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(auk)
+library(lubridate)
+library(sf)
+library(gridExtra)
+library(tidyverse)
+library(rnaturalearth)
+library(dplyr)
+
+library(raster)
+library(MODIS)
+library(exactextractr)
+library(viridis)
+library(dggridR)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(pscl)
+library(MASS)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Part A: Loading GIS Data
+
+```{r}
+# Create a file for saving spatial data
+gpkg_dir <- "data"
+if (!dir.exists(gpkg_dir)) {
+  dir.create(gpkg_dir)
+}
+f_ne <- file.path(gpkg_dir, "gis-data.gpkg")
+
+# Load in manually downloaded BCR terrestrial shapefile for BCR 31
+bcr <- file.path("D:", "bird folders", "White Ibis", "data", "BCR_Terrestrial_master_International.shp") %>% 
+  read_sf() %>% 
+  select(bcr_code = BCR, bcr_name = LABEL) %>% 
+# Select BCR 31, Peninsular Florida
+  filter(bcr_code %in% c(31))
+
+# Load in manually downloaded Natural Earth GIS data
+
+ne_land <- file.path("D:", "bird folders", "White Ibis", "data", "ne_50m_admin_0_countries_lakes.shp") %>%
+  read_sf()
+
+ne_land <- ne_land %>%
+  st_set_precision(1e6) %>%
+  st_union()
+
+ne_country_lines <- file.path("D:", "bird folders", "White Ibis", "data", "ne_50m_admin_0_boundary_lines_land.shp") %>%
+  read_sf()
+
+ne_country_lines <- ne_country_lines %>%
+  st_geometry()
+
+ne_state_lines <- file.path("D:", "bird folders", "White Ibis", "data", "ne_50m_admin_1_states_provinces_lines.shp") %>%
+  read_sf()
+
+# Save for future use
+unlink(f_ne)
+write_sf(ne_land, f_ne, "ne_land")
+write_sf(ne_country_lines, f_ne, "ne_country_lines")
+write_sf(ne_state_lines, f_ne, "ne_state_lines")
+write_sf(bcr, f_ne, "bcr")
+```
+
+```{r}
+# Clear the workspace
+rm(list=ls())
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+
+# Load in the white ibis data from Part 1
+ibis <- read_csv("data/ebd_white_ibis.csv", show_col_types = FALSE)
+```
+
+## Part B: Preparing Environmental Covariates
+
+Establish the spatial boundary for BCR 31
+
+```{r}
+# BCR 31 boundary
+bcr <- read_sf("data/gis-data.gpkg", "bcr") %>% 
+  filter(bcr_code == 31) %>% 
+  # project to the native modis projection
+  st_transform(crs = paste("+proj=sinu +lon_0=0 +x_0=0 +y_0=0",
+                           "+a=6371007.181 +b=6371007.181 +units=m +no_defs"))
+```
+
+Get data for the MODIS tiles that cover BCR 31
+
+```{r}
+# Switch off spherical geometry
+sf_use_s2(FALSE)
+
+# Get tiles for BCR 31, the Floridian peninsula
+tiles <- MODIS::getTile(bcr)
+tiles@tile
+```
+
+Load this MODIS land cover data into R
+
+```{r, warning = FALSE}
+# Earliest year of ibis dataset
+begin_year <- format(min(ibis$observation_date), "%Y.01.01")
+
+# Last year of ibis dataset
+end_year <- format(max(ibis$observation_date), "%Y.12.31")
+
+# Download tiles and combine into a single raster for each year
+tifs <- runGdal(product = "MCD12Q1", collection = "006", SDSstring = "01", 
+                extent = bcr %>% st_buffer(dist = 10000), 
+                begin = begin_year, end = end_year, 
+                outDirPath = "data", job = "modis",
+                MODISserverOrder = "LPDAAC") %>% 
+  pluck("MCD12Q1.006") %>% 
+  unlist()
+
+# Rename the tifs to have better names
+new_names <- format(as.Date(names(tifs)), "%Y") %>%
+  sprintf("modis_mcd12q1_umd_%s.tif", .) %>%
+  file.path(dirname(tifs), .)
+
+file.rename(tifs, new_names)
+```
+
+```{r}
+# Loading in the landcover data
+landcover <- list.files("data/modis", "^modis_mcd12q1_umd",
+                        full.names = TRUE) %>%
+  stack()
+
+# Label the layers with year
+landcover <- names(landcover) %>%
+  str_extract("(?<=modis_mcd12q1_umd_)[0-9]{4}") %>%
+  paste0("y", .) %>%
+  setNames(landcover, .)
+
+# Extract the last year in the land cover data
+max_lc_year <- names(landcover) %>%
+  str_extract("[0-9]{4}") %>%
+  as.integer() %>%
+  max()
+```
+
+Establish neighborhood radius of 2.5 kilometers
+
+```{r}
+neighborhood_radius <- 5 * ceiling(max(res(landcover))) /2
+```
+
+Obtain the full set of distinct checklist locations by year, then create a neighborhood around each location by year
+
+```{r}
+bird_buff <- ibis %>%
+  distinct(year = format(observation_date, "%Y"),
+           locality_id, latitude, longitude) %>%
+# In case the maximum ibis year is after the maximum land cover year available
+# Extend the maximum land cover year data to all future years
+  mutate(year_lc = if_else(as.integer(year) > max_lc_year,
+                           as.character(max_lc_year), year),
+         year_lc = paste0("y", year_lc)) %>%
+# Convert to sf with crs = 4326
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+# Transform to the MODIS projection
+  st_transform(crs = projection(landcover)) %>%
+# Create an area around each point
+  st_buffer(dist = neighborhood_radius) %>%
+# Nest by year
+  nest(data = c(year, locality_id, geometry))
+```
+
+Calculate the number of cells belonging to each land cover class for each checklist location, by year
+
+```{r}
+# Establish a function to summarize landcover data for all locations in a given year
+calculate_pland <- function(yr, regions, lc) {
+  locs <- st_set_geometry(regions, NULL)
+  exact_extract(lc[[yr]], regions, progress = FALSE) %>%
+    map(~ count(., landcover = value)) %>%
+    tibble(locs, data = .) %>%
+    unnest(data)
+}
+
+# Iterate over all years, extracting the land cover values for all locations in each year
+lc_extract <- bird_buff %>%
+  mutate(pland = map2(year_lc, data, calculate_pland, lc = landcover)) %>%
+  select(pland) %>%
+  unnest(cols = pland)
+```
+
+Calculate the proportion of land cover for each location and land cover class, by year
+
+```{r}
+pland <- lc_extract %>%
+# Calculate proportions
+  group_by(locality_id, year) %>%
+  mutate(pland = n / sum(n)) %>%
+  ungroup() %>%
+  select(-n) %>%
+  filter(!is.na(landcover))
+```
+
+Change covariate names and turn the data into a wide format
+
+```{r}
+lc_names <- tibble(landcover = 0:15,
+                   lc_name = c("pland_00_water", 
+                               "pland_01_evergreen_needleleaf", 
+                               "pland_02_evergreen_broadleaf", 
+                               "pland_03_deciduous_needleleaf", 
+                               "pland_04_deciduous_broadleaf", 
+                               "pland_05_mixed_forest",
+                               "pland_06_closed_shrubland", 
+                               "pland_07_open_shrubland", 
+                               "pland_08_woody_savanna", 
+                               "pland_09_savanna", 
+                               "pland_10_grassland", 
+                               "pland_11_wetland", 
+                               "pland_12_cropland", 
+                               "pland_13_urban", 
+                               "pland_14_mosaic", 
+                               "pland_15_barren"))
+
+pland <- pland %>%
+  inner_join(lc_names, by = "landcover") %>%
+  arrange(landcover) %>%
+  select(-landcover)
+
+# As I transform to the wide format, I'll fill in any implicit missing values with 0. 
+pland <- pland %>%
+  pivot_wider(names_from = lc_name,
+              values_from = pland,
+              values_fill = list(pland = 0))
+```
+
+Manually re-create pland 03, since it is "lost" / missing for an unknown reason
+
+```{r}
+pland <- pland %>%
+  mutate(pland_03_deciduous_needleleaf = 1 - (pland_00_water
+                               + pland_01_evergreen_needleleaf 
+                               + pland_02_evergreen_broadleaf
+                               + pland_04_deciduous_broadleaf 
+                               + pland_05_mixed_forest
+                               + pland_06_closed_shrubland
+                               + pland_07_open_shrubland 
+                               + pland_08_woody_savanna 
+                               + pland_09_savanna
+                               + pland_10_grassland
+                               + pland_11_wetland 
+                               + pland_12_cropland 
+                               + pland_13_urban
+                               + pland_14_mosaic 
+                               + pland_15_barren))
+```
+
+Save the land cover file
+
+```{r}
+write_csv(pland, "data/modis_pland_location_year.csv")
+```
+
+Load manually downloaded elevation data, then crop to our study area
+
+```{r}
+# Load in the data
+elev <- raster("data/elevation_1KMmd_GMTEDmd.tif")
+
+# Crop to BCR 31, including a buffer for "wiggle room"
+elev <- bcr %>%
+  st_buffer(dist = 10000) %>%
+  st_transform(crs = projection(elev)) %>%
+  crop(elev, .) %>%
+  projectRaster(crs = projection(landcover))
+```
+
+Extract the elevation values that correspond to each area, then use these values to calculate mean and standard deviation of elevation in each area
+
+```{r}
+bird_buff_no_year <- ibis %>%
+  distinct(locality_id, latitude, longitude) %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326) %>%
+  st_transform(crs = projection(elev)) %>%
+  st_buffer(dist = neighborhood_radius)
+
+locs <- st_set_geometry(bird_buff_no_year, NULL) %>%
+  mutate(id = row_number())
+
+elev_checklists <- exact_extract(elev, bird_buff_no_year, progress = FALSE) %>%
+  map_dfr(~ tibble(elevation_mean = mean(.$value, na.rm = TRUE),
+                   elevation_median = median(.$value, na.rm = TRUE),
+                   elevation_sd = sd(.$value, na.rm = TRUE),
+                   elevation_iqr = IQR(.$value, na.rm = TRUE))) %>%
+
+  bind_cols(locs, .)
+```
+
+Merge the environmental covariates together and save the dataset
+
+```{r}
+# Merge the land cover and elevation covariates
+pland_elev_checklist <- inner_join(pland, elev_checklists, by = "locality_id")
+
+# Save the data
+write_csv(pland_elev_checklist, "data/pland_elev_location_year.csv")
+```
+
+## Part C: Merging the Data
+
+## Prepare the data
+
+```{r}
+# Establish the output directory
+
+if (!dir.exists("output")) {
+  dir.create("output")
+}
+```
+
+```{r}
+# Read in all ten sets of eBird data and the environmental covariates
+# Establish the variable `year` for all datasets for the purposes of merging the data
+
+white.ibis <- read_csv("data/ebd_white_ibis.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+```
+
+```{r}
+glossy.ibis <- read_csv("data/ebd_glossy_ibis.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+roseate <- read_csv("data/ebd_spoonbill.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+great.egret <- read_csv("data/ebd_great_egret.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+snowy.egret <- read_csv("data/ebd_snowy_egret.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+cattle.egret <- read_csv("data/ebd_cattle_egret.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+# Note: "gbh" is Great Blue Heron
+
+gbh <- read_csv("data/ebd_gbh.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+# Note: "lbh" is Little Blue Heron
+
+lbh <- read_csv("data/ebd_lbh.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+tri.heron <- read_csv("data/ebd_tri_heron.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+
+green.heron <- read_csv("data/ebd_green_heron.csv", show_col_types = FALSE) %>%
+  mutate(year = year(observation_date))
+```
+
+```{r}
+habitat <- read_csv("data/pland_elev_location_year.csv", show_col_types = FALSE) %>%
+  mutate(year = as.integer(year))
+```
+
+```{r}
+# Troubleshooting: this should print TRUE
+nrow(habitat) == 21751
+```
+
+## White ibis
+
+```{r}
+# Join the datasets 
+white.ibis.habitat <- inner_join(white.ibis, habitat, by = c("locality_id", "year"))
+```
+
+```{r}
+# Troubleshooting
+nrow(white.ibis.habitat) == 51496
+
+nrow(filter(white.ibis.habitat, year == 2016)) == 3859
+
+nrow(filter(white.ibis.habitat, year == 2017)) == 5181
+```
+
+
+```{r}
+# Remove NA counts
+white.ibis.abundance <- white.ibis.habitat %>% filter(!is.na(observation_count))
+```
+
+```{r}
+# Rename two variables
+white.ibis.abundance$distance_traveled_km <- white.ibis.abundance$effort_distance_km
+
+white.ibis.abundance$bird_count <- white.ibis.abundance$observation_count
+
+# Filter training data and save the file
+white.ibis.2016 <- white.ibis.abundance %>% filter(year == 2016)
+
+write_csv(white.ibis.2016, "data/ebd_white_ibis_2016.csv", na = "")
+
+# Filter test data and save the file
+white.ibis.2017 <- white.ibis.abundance %>% filter(year == 2017)
+
+write_csv(white.ibis.2017, "data/ebd_white_ibis_2017.csv", na = "")
+```
+
+## Glossy ibis
+
+```{r}
+# Join the datasets 
+glossy.ibis.habitat <- inner_join(glossy.ibis, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+glossy.ibis.abundance <- glossy.ibis.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+glossy.ibis.abundance$distance_traveled_km <- glossy.ibis.abundance$effort_distance_km
+
+glossy.ibis.abundance$bird_count <- glossy.ibis.abundance$observation_count
+
+# Filter training data and save the file
+glossy.ibis.2016 <- glossy.ibis.abundance %>% filter(year == 2016)
+
+write_csv(glossy.ibis.2016, "data/ebd_glossy_ibis_2016.csv", na = "")
+
+# Filter test data and save the file
+glossy.ibis.2017 <- glossy.ibis.abundance %>% filter(year == 2017)
+
+write_csv(glossy.ibis.2017, "data/ebd_glossy_ibis_2017.csv", na = "")
+```
+
+## Roseate spoonbill
+
+```{r}
+# Join the datasets 
+roseate.habitat <- inner_join(roseate, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+roseate.abundance <- roseate.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+roseate.abundance$distance_traveled_km <- roseate.abundance$effort_distance_km
+
+roseate.abundance$bird_count <- roseate.abundance$observation_count
+
+# Filter training data and save the file
+roseate.2016 <- roseate.abundance %>% filter(year == 2016)
+
+write_csv(roseate.2016, "data/ebd_spoonbill_2016.csv", na = "")
+
+# Filter test data and save the file
+roseate.2017 <- roseate.abundance %>% filter(year == 2017)
+
+write_csv(roseate.2017, "data/ebd_spoonbill_2017.csv", na = "")
+```
+
+## Great egret
+
+```{r}
+# Join the datasets 
+great.egret.habitat <- inner_join(great.egret, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+great.egret.abundance <- great.egret.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+great.egret.abundance$distance_traveled_km <- great.egret.abundance$effort_distance_km
+
+great.egret.abundance$bird_count <- great.egret.abundance$observation_count
+
+# Filter training data and save the file
+great.egret.2016 <- great.egret.abundance %>% filter(year == 2016)
+
+write_csv(great.egret.2016, "data/ebd_great_egret_2016.csv", na = "")
+
+# Filter test data and save the file
+great.egret.2017 <- great.egret.abundance %>% filter(year == 2017)
+
+write_csv(great.egret.2017, "data/ebd_great_egret_2017.csv", na = "")
+```
+
+## Cattle egret
+
+```{r}
+# Join the datasets 
+cattle.egret.habitat <- inner_join(cattle.egret, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+cattle.egret.abundance <- cattle.egret.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+cattle.egret.abundance$distance_traveled_km <- cattle.egret.abundance$effort_distance_km
+
+cattle.egret.abundance$bird_count <- cattle.egret.abundance$observation_count
+
+# Filter training data and save the file
+cattle.egret.2016 <- cattle.egret.abundance %>% filter(year == 2016)
+
+write_csv(cattle.egret.2016, "data/ebd_cattle_egret_2016.csv", na = "")
+
+# Filter test data and save the file
+cattle.egret.2017 <- cattle.egret.abundance %>% filter(year == 2017)
+
+write_csv(cattle.egret.2017, "data/ebd_cattle_egret_2017.csv", na = "")
+```
+
+## Snowy egret
+
+```{r}
+# Join the datasets 
+snowy.egret.habitat <- inner_join(snowy.egret, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+snowy.egret.abundance <- snowy.egret.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+snowy.egret.abundance$distance_traveled_km <- snowy.egret.abundance$effort_distance_km
+
+snowy.egret.abundance$bird_count <- snowy.egret.abundance$observation_count
+
+# Filter training data and save the file
+snowy.egret.2016 <- snowy.egret.abundance %>% filter(year == 2016)
+
+write_csv(snowy.egret.2016, "data/ebd_snowy_egret_2016.csv", na = "")
+
+# Filter test data and save the file
+snowy.egret.2017 <- snowy.egret.abundance %>% filter(year == 2017)
+
+write_csv(snowy.egret.2017, "data/ebd_snowy_egret_2017.csv", na = "")
+```
+
+## Great blue heron
+
+```{r}
+# Join the datasets 
+gbh.habitat <- inner_join(gbh, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+gbh.abundance <- gbh.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+gbh.abundance$distance_traveled_km <- gbh.abundance$effort_distance_km
+
+gbh.abundance$bird_count <- gbh.abundance$observation_count
+
+# Filter training data and save the file
+gbh.2016 <- gbh.abundance %>% filter(year == 2016)
+
+write_csv(gbh.2016, "data/ebd_gbh_2016.csv", na = "")
+
+# Filter test data and save the file
+gbh.2017 <- gbh.abundance %>% filter(year == 2017)
+
+write_csv(gbh.2017, "data/ebd_gbh_2017.csv", na = "")
+```
+
+## Little blue heron
+
+```{r}
+# Join the datasets 
+lbh.habitat <- inner_join(lbh, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+lbh.abundance <- lbh.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+lbh.abundance$distance_traveled_km <- lbh.abundance$effort_distance_km
+
+lbh.abundance$bird_count <- lbh.abundance$observation_count
+
+# Filter training data and save the file
+lbh.2016 <- lbh.abundance %>% filter(year == 2016)
+
+write_csv(lbh.2016, "data/ebd_lbh_2016.csv", na = "")
+
+# Filter test data and save the file
+lbh.2017 <- lbh.abundance %>% filter(year == 2017)
+
+write_csv(lbh.2017, "data/ebd_lbh_2017.csv", na = "")
+```
+
+## Tricolored heron
+
+```{r}
+# Join the datasets 
+tri.heron.habitat <- inner_join(tri.heron, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+tri.heron.abundance <- tri.heron.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+tri.heron.abundance$distance_traveled_km <- tri.heron.abundance$effort_distance_km
+
+tri.heron.abundance$bird_count <- tri.heron.abundance$observation_count
+
+# Filter training data and save the file
+tri.heron.2016 <- tri.heron.abundance %>% filter(year == 2016)
+
+write_csv(tri.heron.2016, "data/ebd_tri_heron_2016.csv", na = "")
+
+# Filter test data and save the file
+tri.heron.2017 <- tri.heron.abundance %>% filter(year == 2017)
+
+write_csv(tri.heron.2017, "data/ebd_tri_heron_2017.csv", na = "")
+```
+
+## Green heron
+
+```{r}
+# Join the datasets 
+green.heron.habitat <- inner_join(green.heron, habitat, by = c("locality_id", "year"))
+
+# Remove NA counts
+green.heron.abundance <- green.heron.habitat %>% filter(!is.na(observation_count))
+
+# Rename two variables
+green.heron.abundance$distance_traveled_km <- green.heron.abundance$effort_distance_km
+
+green.heron.abundance$bird_count <- green.heron.abundance$observation_count
+
+# Filter training data and save the file
+green.heron.2016 <- green.heron.abundance %>% filter(year == 2016)
+
+write_csv(green.heron.2016, "data/ebd_green_heron_2016.csv", na = "")
+
+# Filter test data and save the file
+green.heron.2017 <- green.heron.abundance %>% filter(year == 2017)
+
+write_csv(green.heron.2017, "data/ebd_green_heron_2017.csv", na = "")
+```

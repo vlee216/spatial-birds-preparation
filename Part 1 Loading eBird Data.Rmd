@@ -1,0 +1,124 @@
+---
+title: 'Part 1: Loading eBird Data'
+author: "Veronica Lee"
+date: "12/1/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(auk)
+library(lubridate)
+library(sf)
+library(gridExtra)
+library(tidyverse)
+# Resolve which select() I am using
+select <- dplyr::select
+
+# Run the very first time only
+# auk_set_ebd_path("D:/bird data/ebd_relJul-2021/ebd_relJul-2021.txt")
+```
+
+## Select the desired species
+
+```{r}
+# Input "White Ibis", "Glossy Ibis", "Roseate Spoonbill", etc for "Species Name"
+SpeciesName <- "Species Name"
+species_name <- tolower(gsub(" ", "_", SpeciesName))
+```
+
+# Run for selected species
+
+```{r}
+# Create a data directory within my R Project
+dir.create("data", showWarnings = FALSE)
+
+# Establish the version of the EBD and SED to use
+ebd <- auk_ebd("D:/bird data/ebd_relJul-2021/ebd_relJul-2021.txt/ebd_relJul-2021.txt", file_sampling = "D:/bird data/ebd_sampling_relJul-2021/ebd_sampling_relJul-2021.txt/ebd_sampling_relJul-2021.txt")
+
+# Establish filters for extracting data
+species_filters <- ebd %>%
+  # Extract observations of the selected species
+  auk_species(SpeciesName) %>%
+  # In BCR 31 (Floridian peninsula)
+  auk_bcr(bcr = 31) %>%
+  # In the month of June
+  auk_date(date = c("*-06-01", "*-06-30")) %>%
+  # Using only the standard traveling and stationary count protocols
+  auk_protocol(protocol = c("Stationary", "Traveling")) %>%
+  auk_complete()
+```
+
+```{r}
+# Establish how to output files
+data_dir <- "data"
+if (!dir.exists(data_dir)) {
+  dir.create(data_dir)
+}
+f_ebd <- file.path(data_dir, "ebd_white_ibis.txt")
+f_sampling <- file.path(data_dir, "ebd_white_ibis_checklists.txt")
+
+# Apply filters to both the EBD and SED; output the files as established above
+if (!file.exists(f_ebd)) {
+  auk_filter(species_filters, file = f_ebd, file_sampling = f_sampling)
+}
+
+# Zero-fill the data
+species_zf <- auk_zerofill(f_ebd, f_sampling, collapse = TRUE)
+```
+
+```{r}
+# Establish a function that will convert the starting time of the checklist to hours since midnight.
+time_to_decimal <- function(x) {
+  x <- hms(x, quiet = TRUE)
+  hour(x) + minute(x) / 60 + second(x) / 3600
+}
+
+# Transform variables
+species_zf <- species_zf %>%
+  mutate(
+    # Set "X" values for species counts to NA values
+    observation_count = if_else(observation_count == "X", NA_character_, observation_count),
+    # Set distance traveled to 0 for stationary checklists
+    effort_distance_km = if_else(protocol_type != "Traveling", 0, effort_distance_km),
+    # Convert time to a decimal value between 0 and 24
+    time_observations_started = time_to_decimal(time_observations_started),
+    # Create variable for the year of the observation
+    year = year(observation_date),
+    # Create variable for the day of the observation
+    day_of_year = yday(observation_date)
+  )
+
+# Filter for the following
+species_filtered <- species_zf %>%
+  filter(
+    # Checklists that are no longer than 5 hours
+    duration_minutes <= 5 * 60,
+    # Checklists that are no longer than 5 km
+    effort_distance_km <= 5,
+    # Checklists that have no more than 10 observers
+    number_observers <= 10
+  )
+
+# Restrict to the years 2012 and later
+species_zf_filtered <- species_zf_filtered %>%
+  filter(year >= 2012)
+
+# Select only the columns necessary for my later modeling
+species <- species_zf_filtered %>%
+select(checklist_id, observer_id,
+         sampling_event_identifier,
+         species_observed, observation_count, 
+         state_code, locality_id, latitude, longitude,
+         protocol_type, all_species_reported,
+         observation_date, year, day_of_year,
+         time_observations_started, 
+         duration_minutes, effort_distance_km,
+         number_observers)
+```
+
+```{r}
+# Save the data
+write_csv(white_ibis, paste0("data/ebd_", species.name, ".csv"), na = "")
+```

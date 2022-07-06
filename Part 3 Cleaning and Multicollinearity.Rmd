@@ -1,0 +1,147 @@
+---
+title: 'Part 3: Variable Cleaning and Multicollinearity Analysis'
+author: "Veronica Lee"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(dggridR)
+library(lubridate)
+library(ranger)
+library(scam)
+library(PresenceAbsence)
+library(verification)
+library(ebirdst)
+library(fields)
+library(gridExtra)
+library(tidyverse)
+library(pscl)
+library(MASS)
+
+# for the round2() function
+library(numform)
+
+# Spatial packages
+library(spdep)
+library(rgdal)
+library(tripack)
+library(dbscan)
+library(hglm)
+
+# Resolve namespace conflicts
+select <- dplyr::select
+map <- purrr::map
+projection <- raster::projection
+```
+
+## Load white ibis data
+
+```{r}
+# Load training data
+ibis.2016 <- read_csv("data/ebd_white_ibis_2016.csv", show_col_types = FALSE)
+
+# Load test data
+ibis.2017 <- read_csv("data/ebd_white_ibis_2017.csv", show_col_types = FALSE)
+```
+
+## Check for variables with fewer than 5 percent nonzero values
+
+```{r}
+ibis.select <- ibis.2016 %>% select(bird_count, time_observations_started, duration_minutes, distance_traveled_km, number_observers, pland_01_evergreen_needleleaf, pland_02_evergreen_broadleaf, pland_03_deciduous_needleleaf, pland_04_deciduous_broadleaf, pland_05_mixed_forest, pland_06_closed_shrubland, pland_07_open_shrubland, pland_08_woody_savanna, pland_09_savanna, pland_10_grassland, pland_11_wetland, pland_12_cropland, pland_13_urban, pland_14_mosaic, pland_15_barren, elevation_mean, elevation_sd)
+
+# If TRUE, the given variable has less than 5 percent nonzero values
+round(sapply(ibis.select, function(x) sum(x != 0)), 3) < round(nrow(ibis.2016)*0.05, 0)
+```
+
+##	Evaluate the spread of nonzero values for each flagged variable
+
+```{r}
+table(ibis.2016$pland_01_evergreen_needleleaf)
+```
+
+```{r}
+table(ibis.2016$pland_04_deciduous_broadleaf)
+```
+
+```{r}
+table(ibis.2016$pland_05_mixed_forest)
+```
+
+```{r}
+table(ibis.2016$pland_06_closed_shrubland)
+```
+
+```{r}
+table(ibis.2016$pland_07_open_shrubland)
+```
+
+```{r}
+table(ibis.2016$pland_12_cropland)
+```
+
+```{r}
+table(ibis.2016$pland_15_barren)
+```
+
+For caution's sake, we will investigate pland_03 even though it was not marked as potentially concerning by our threshold approach. This was the variable that we had to manually generate because it was not present in the MODIS data we downloaded.
+
+```{r}
+table(ibis.2016$pland_03_deciduous_needleleaf)
+```
+
+We will keep these variables in our model:
+
+- pland_04_deciduous_broadleaf
+- pland_12_cropland
+
+And drop these variables from our model:
+
+- pland_01_evergreen_needleleaf
+- pland_03_deciduous_needleleaf
+- pland_05_mixed_forest
+- pland_06_closed_shrubland
+- pland_07_open_shrubland
+- pland_15_barren
+
+##	Establish an initial quasi-Poisson model
+
+```{r}
+glm.formula <- bird_count ~ time_observations_started + duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_09_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+qpois.0 <- glm(glm.formula, family = "quasipoisson", data = ibis.2016)
+```
+
+##	Perform multicollinearity analysis
+
+```{r}
+car::vif(qpois.0)
+
+max(car::vif(qpois.0))
+```
+
+##	Plot the histogram of the four multicollinear variable
+
+```{r}
+hist(ibis.2016$pland_08_woody_savanna + ibis.2016$pland_09_savanna + ibis.2016$pland_11_wetland + ibis.2016$pland_13_urban)
+```
+
+We will choose to drop one of these four variables in order to resolve the problem. We will then drop the same predictor in the pipelines for all other species moving forward, in order to be consistent. We do not want to drop the pland variables for wetland or urban, because we think they are relevant to the species at hand. We decided to drop pland 09 (savanna).
+
+## Check that multicollinearity was resolved
+
+```{r}
+# Establish GLM formula with savanna dropped
+glm.formula.2 <- bird_count ~ time_observations_started + 
+duration_minutes + distance_traveled_km + number_observers + pland_02_evergreen_broadleaf + pland_04_deciduous_broadleaf + pland_08_woody_savanna + pland_10_grassland + pland_11_wetland + pland_12_cropland + pland_13_urban + pland_14_mosaic + elevation_mean + elevation_sd
+
+# Fit the new quasi-Poisson GLM
+qpois.1 <- glm(glm.formula.2, family = "quasipoisson", data = ibis.2016)
+
+# Check that the highest VIF value is now less than 5
+max(car::vif(qpois.1))
+```
